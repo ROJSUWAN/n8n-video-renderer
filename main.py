@@ -1,131 +1,150 @@
-import os, uuid, json, subprocess, tempfile, shutil
-from typing import List, Optional
+import os
+import uuid
+import shutil
+import subprocess
+from typing import List
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google.cloud import storage
 
 app = FastAPI()
 
-# ===== Models =====
-class Scene(BaseModel):
-    scene_order: int
-    duration_sec: int
-    pixabay_video_url: str
-    tts_audio_url: str
-    script: Optional[str] = None
 
+# ==========================
+# Request Model
+# ==========================
 class RenderRequest(BaseModel):
-    project_id: str
-    language: str = "th-TH"
-    style: str = "A"
-    scenes: List[Scene]
-    # output config
-    out_bucket: str
-    out_prefix: str = "renders"
-    aspect: str = "16:9"   # "16:9" or "9:16"
-    resolution: str = "1920x1080"  # for 9:16 use 1080x1920
+    video_urls: List[str]
+    audio_url: str
 
-def run(cmd: List[str]):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"CMD failed: {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}")
-    return p.stdout
 
-def download(url: str, out_path: str):
-    # curl is usually present; if not, switch to python requests later
-    run(["bash", "-lc", f"curl -L --fail --retry 3 --retry-delay 1 -o {shlex(out_path)} {shlex(url)}"])
+# ==========================
+# Utils
+# ==========================
 
-def shlex(path: str) -> str:
-    return "'" + path.replace("'", "'\"'\"'") + "'"
+def run_cmd(cmd: List[str]):
+    """Run subprocess command safely"""
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    if result.returncode != 0:
+        raise Exception(result.stderr)
+    return result.stdout
 
-def upload_gcs(local_path: str, bucket: str, object_name: str) -> str:
-    client = storage.Client()
-    b = client.bucket(bucket)
-    blob = b.blob(object_name)
-    blob.upload_from_filename(local_path, content_type="video/mp4")
-    # direct URL (works if object is public OR you later switch to signed URLs)
-    return f"https://storage.googleapis.com/{bucket}/{object_name}"
+
+def download_file(url: str, output_path: str):
+    """Download file using curl (simpler inside Railway container)"""
+    cmd = [
+        "curl",
+        "-L",
+        url,
+        "-o",
+        output_path
+    ]
+    run_cmd(cmd)
+
+
+def concat_videos(video_paths: List[str], output_path: str):
+    """
+    Concat videos using FFmpeg concat demuxer
+    Handles safe quoting properly (FIXED VERSION)
+    """
+    list_file = f"/tmp/{uuid.uuid4()}.txt"
+
+    with open(list_file, "w") as f:
+        for p in video_paths:
+            # 🔥 FIXED (no backslash inside f-string expression)
+            escaped = p.replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    cmd = [
+        "ffmpeg",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        output_path
+    ]
+
+    run_cmd(cmd)
+
+    os.remove(list_file)
+
+
+def merge_audio(video_path: str, audio_path: str, output_path: str):
+    """
+    Merge audio into final video
+    """
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        output_path
+    ]
+
+    run_cmd(cmd)
+
+
+# ==========================
+# API Endpoint
+# ==========================
 
 @app.post("/render")
-def render(req: RenderRequest):
-    if not req.scenes:
-        raise HTTPException(400, "scenes is empty")
+def render_video(req: RenderRequest):
 
-    # sort scenes
-    scenes = sorted(req.scenes, key=lambda s: s.scene_order)
+    if not req.video_urls:
+        raise HTTPException(status_code=400, detail="No video URLs provided")
 
-    # choose resolution
-    if req.aspect == "9:16":
-        target_res = req.resolution or "1080x1920"
-    else:
-        target_res = req.resolution or "1920x1080"
+    work_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{work_id}"
+    os.makedirs(work_dir, exist_ok=True)
 
-    job_id = f"{req.project_id}_{uuid.uuid4().hex[:8]}"
-
-    workdir = tempfile.mkdtemp(prefix="render_")
     try:
-        parts = []
-        for s in scenes:
-            v_in = os.path.join(workdir, f"v_{s.scene_order:03d}.mp4")
-            a_in = os.path.join(workdir, f"a_{s.scene_order:03d}.mp3")
+        # --------------------------
+        # 1️⃣ Download videos
+        # --------------------------
+        video_files = []
+        for i, url in enumerate(req.video_urls):
+            path = f"{work_dir}/video_{i}.mp4"
+            download_file(url, path)
+            video_files.append(path)
 
-            # download video + audio
-            run(["bash","-lc", f"curl -L --fail --retry 3 -o {shlex(v_in)} {shlex(s.pixabay_video_url)}"])
-            run(["bash","-lc", f"curl -L --fail --retry 3 -o {shlex(a_in)} {shlex(s.tts_audio_url)}"])
+        # --------------------------
+        # 2️⃣ Download audio
+        # --------------------------
+        audio_path = f"{work_dir}/audio.mp3"
+        download_file(req.audio_url, audio_path)
 
-            out_part = os.path.join(workdir, f"part_{s.scene_order:03d}.mp4")
+        # --------------------------
+        # 3️⃣ Concat videos
+        # --------------------------
+        concat_path = f"{work_dir}/concat.mp4"
+        concat_videos(video_files, concat_path)
 
-            # scale/pad video to target, trim both to duration, then mux
-            # -shortest ensures it stops when either ends (we also trim explicitly)
-            vf = (
-                f"scale={target_res}:force_original_aspect_ratio=decrease,"
-                f"pad={target_res}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-            )
+        # --------------------------
+        # 4️⃣ Merge audio
+        # --------------------------
+        final_output = f"{work_dir}/final.mp4"
+        merge_audio(concat_path, audio_path, final_output)
 
-            cmd = [
-                "ffmpeg","-y",
-                "-i", v_in,
-                "-i", a_in,
-                "-t", str(s.duration_sec),
-                "-vf", vf,
-                "-c:v","libx264","-preset","veryfast","-crf","22",
-                "-c:a","aac","-b:a","128k",
-                "-shortest",
-                out_part
-            ]
-            run(cmd)
-            parts.append(out_part)
-
-        # concat parts
-        concat_list = os.path.join(workdir, "concat.txt")
-        with open(concat_list, "w", encoding="utf-8") as f:
-            for p in parts:
-                f.write(f"file '{p.replace(\"'\", \"'\\\\''\")}'\n")
-
-        final_mp4 = os.path.join(workdir, f"{job_id}.mp4")
-        run([
-            "ffmpeg","-y",
-            "-f","concat","-safe","0",
-            "-i", concat_list,
-            "-c","copy",
-            final_mp4
-        ])
-
-        # upload to GCS
-        object_name = f"{req.out_prefix}/{req.project_id}/{job_id}.mp4"
-        url = upload_gcs(final_mp4, req.out_bucket, object_name)
-
+        # --------------------------
+        # 5️⃣ Return response
+        # --------------------------
         return {
-            "job_id": job_id,
-            "output_gcs_object": object_name,
-            "output_url": url
+            "status": "success",
+            "output_path": final_output
         }
 
     except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    finally:
+        # Cleanup (optional - comment out if debugging)
+        pass
+        # shutil.rmtree(work_dir, ignore_errors=True)

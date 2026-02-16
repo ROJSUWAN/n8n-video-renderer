@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 # Optional: GCS upload
@@ -24,6 +24,7 @@ except Exception:
 # Config
 # -----------------------------
 APP_NAME = "n8n-video-renderer"
+
 DEFAULT_FPS = int(os.getenv("VIDEO_FPS", "30"))
 DEFAULT_WIDTH = int(os.getenv("VIDEO_WIDTH", "1280"))
 DEFAULT_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "720"))
@@ -38,12 +39,17 @@ GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
 GCS_PUBLIC = os.getenv("GCS_PUBLIC", "false").lower() in ("1", "true", "yes")
 
 # If you keep service account json in env:
-#   GOOGLE_APPLICATION_CREDENTIALS=/app/sa.json   (file path) OR
 #   GCP_SA_JSON='{"type": "..."}'  (json string)
+# or rely on GOOGLE_APPLICATION_CREDENTIALS / workload identity
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
 # Railway uses PORT env var
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Requests defaults
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "90"))
+DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "2"))
+
 
 app = FastAPI(title=APP_NAME)
 
@@ -78,25 +84,44 @@ def _run(cmd: List[str]) -> None:
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+            "Command failed:\n"
+            f"CMD: {' '.join(cmd)}\n\n"
+            f"STDOUT:\n{proc.stdout}\n\n"
+            f"STDERR:\n{proc.stderr}\n"
         )
 
 
 def _safe_filename(name: str) -> str:
-    name = name.strip()
+    name = (name or "").strip()
     name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
-    return name[:180] if name else str(uuid.uuid4())
+    return name[:180] if name else f"{uuid.uuid4().hex}.mp4"
 
 
-def _download(url: str, out_path: Path, timeout: int = 120) -> None:
-    """Download url to out_path."""
+def _download(url: str, out_path: Path, timeout: int = DOWNLOAD_TIMEOUT, retries: int = DOWNLOAD_RETRIES) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise RuntimeError(f"Invalid URL scheme: {url}")
+
+    last_err: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                continue
+            raise RuntimeError(f"Download failed after {retries+1} attempts: {url} | err={e}") from e
+
+    # should never reach
+    if last_err:
+        raise RuntimeError(str(last_err))
 
 
 def _build_scene_video(
@@ -110,21 +135,24 @@ def _build_scene_video(
 ) -> None:
     """
     Create a scene mp4:
-    - Trim video to duration
-    - Scale to width/height
+    - Trim to duration
+    - Scale/pad to width/height
     - Mux with narration audio
-    - Stop at shortest stream
-    - Re-encode for consistent concat
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+        f"fps={fps}"
+    )
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_in),
         "-i", str(audio_in),
-        "-t", str(duration_sec),
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}",
+        "-t", str(int(duration_sec)),
+        "-vf", vf,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "veryfast",
@@ -137,18 +165,26 @@ def _build_scene_video(
     _run(cmd)
 
 
+def _escape_concat_path(p: Path) -> str:
+    """
+    ffmpeg concat demuxer line format: file 'path'
+    If path contains single quote -> escape as: '\''
+    """
+    s = str(p)
+    return s.replace("'", "'\\''")
+
+
 def _concat_videos(scene_paths: List[Path], out_path: Path) -> None:
     """
     Concat mp4 files using concat demuxer.
-    Files should have same codec/params -> ensured in _build_scene_video.
+    Note: files should have same codec/params -> ensured in _build_scene_video.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     list_file = out_path.parent / "concat_list.txt"
 
     lines = []
     for p in scene_paths:
-        safe_p = str(p).replace("'", "'\\''")
-        lines.append("file '" + safe_p + "'")
+        lines.append("file '" + _escape_concat_path(p) + "'")
 
     list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -187,18 +223,17 @@ def _upload_to_gcs(local_path: Path, object_name: str) -> str:
         blob.make_public()
         return blob.public_url
 
-    # If not public, return signed URL (default 1 hour)
-    url = blob.generate_signed_url(expiration=3600, method="GET")
-    return url
+    # Signed URL (1 hour). Requires service account creds.
+    return blob.generate_signed_url(expiration=3600, method="GET")
 
 
 # -----------------------------
-# Routes (สำคัญกับ Railway)
+# Routes
 # -----------------------------
 @app.get("/")
 def root():
-    # Railway/บาง platform จะ health check ที่ /
-    return {"ok": True, "app": APP_NAME}
+    # IMPORTANT: Railway/ingress health probes often hit "/" first.
+    return {"ok": True, "app": APP_NAME, "port": PORT}
 
 
 @app.get("/health")
@@ -212,8 +247,8 @@ def render(req: RenderRequest):
         raise HTTPException(status_code=400, detail="scenes is empty")
 
     scenes = sorted(req.scenes, key=lambda s: s.scene_order)
-    workdir = Path(tempfile.mkdtemp(prefix="render_"))
 
+    workdir = Path(tempfile.mkdtemp(prefix="render_"))
     try:
         assets_dir = workdir / "assets"
         scenes_dir = workdir / "scenes"
@@ -249,20 +284,15 @@ def render(req: RenderRequest):
         _concat_videos(scene_mp4_paths, final_path)
 
         if req.return_file:
-            return FileResponse(
-                path=str(final_path),
-                media_type="video/mp4",
-                filename=base_name,
-            )
+            return FileResponse(path=str(final_path), media_type="video/mp4", filename=base_name)
 
         if GCS_BUCKET:
             url = _upload_to_gcs(final_path, base_name)
             return {"ok": True, "project_id": req.project_id, "output_url": url, "file": base_name}
 
+        # fallback (debug)
         return {"ok": True, "project_id": req.project_id, "local_file": str(final_path)}
 
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
@@ -276,5 +306,6 @@ def render(req: RenderRequest):
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    # ใช้ "main:app" ให้ชัวร์บน Railway (กันบางกรณี import context)
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+
+    # proxy_headers helps when behind Railway ingress
+    uvicorn.run(app, host="0.0.0.0", port=PORT, proxy_headers=True)

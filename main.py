@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -31,7 +31,7 @@ DEFAULT_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "720"))
 # If you want auto-upload to GCS, set:
 #   GCS_BUCKET=your-bucket
 # Optional:
-#   GCS_PREFIX=videos/
+#   GCS_PREFIX=renders/
 #   GCS_PUBLIC=true  (make public)
 GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
 GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
@@ -66,9 +66,7 @@ class RenderRequest(BaseModel):
     language: Optional[str] = None
     duration_min: Optional[int] = None
     scenes: List[Scene]
-    # If you want override output name:
     output_name: Optional[str] = None
-    # If true, return file directly instead of URL
     return_file: Optional[bool] = False
 
 
@@ -79,7 +77,9 @@ def _run(cmd: List[str]) -> None:
     """Run command and raise on error."""
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
 
 
 def _safe_filename(name: str) -> str:
@@ -88,7 +88,8 @@ def _safe_filename(name: str) -> str:
     return name[:180] if name else str(uuid.uuid4())
 
 
-def _download(url: str, out_path: Path, timeout: int = 60) -> None:
+def _download(url: str, out_path: Path, timeout: int = 120) -> None:
+    """Download url to out_path."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
@@ -113,17 +114,17 @@ def _build_scene_video(
     - Scale to width/height
     - Mux with narration audio
     - Stop at shortest stream
+    - Re-encode for consistent concat
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Re-encode for consistent concat
-    # - Force yuv420p, aac, baseline-friendly
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_in),
         "-i", str(audio_in),
         "-t", str(duration_sec),
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}",
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "veryfast",
@@ -139,15 +140,13 @@ def _build_scene_video(
 def _concat_videos(scene_paths: List[Path], out_path: Path) -> None:
     """
     Concat mp4 files using concat demuxer.
-    Note: files should have same codec/params -> we ensured in _build_scene_video.
+    Files should have same codec/params -> ensured in _build_scene_video.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     list_file = out_path.parent / "concat_list.txt"
 
-    # IMPORTANT: escape single quotes for ffmpeg concat list
     lines = []
     for p in scene_paths:
-        # fix: do NOT do replace with backslash inside f-string expression
         safe_p = str(p).replace("'", "'\\''")
         lines.append("file '" + safe_p + "'")
 
@@ -167,12 +166,9 @@ def _concat_videos(scene_paths: List[Path], out_path: Path) -> None:
 def _gcs_client():
     if storage is None:
         raise RuntimeError("google-cloud-storage is not installed. Add it to requirements.txt")
-    # If service account json provided in env, write it to temp and load
     if GCP_SA_JSON:
         data = json.loads(GCP_SA_JSON)
-        # create client from info
         return storage.Client.from_service_account_info(data)
-    # else rely on GOOGLE_APPLICATION_CREDENTIALS / default creds
     return storage.Client()
 
 
@@ -191,15 +187,20 @@ def _upload_to_gcs(local_path: Path, object_name: str) -> str:
         blob.make_public()
         return blob.public_url
 
-    # If not public, return a signed URL (default 1 hour)
-    # NOTE: requires service account credentials
+    # If not public, return signed URL (default 1 hour)
     url = blob.generate_signed_url(expiration=3600, method="GET")
     return url
 
 
 # -----------------------------
-# Routes
+# Routes (สำคัญกับ Railway)
 # -----------------------------
+@app.get("/")
+def root():
+    # Railway/บาง platform จะ health check ที่ /
+    return {"ok": True, "app": APP_NAME}
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "app": APP_NAME}
@@ -210,10 +211,9 @@ def render(req: RenderRequest):
     if not req.scenes:
         raise HTTPException(status_code=400, detail="scenes is empty")
 
-    # Sort scenes by scene_order
     scenes = sorted(req.scenes, key=lambda s: s.scene_order)
-
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
+
     try:
         assets_dir = workdir / "assets"
         scenes_dir = workdir / "scenes"
@@ -240,7 +240,6 @@ def render(req: RenderRequest):
             )
             scene_mp4_paths.append(scene_out)
 
-        # final output name
         base_name = req.output_name or f"{req.project_id}_{uuid.uuid4().hex[:8]}.mp4"
         base_name = _safe_filename(base_name)
         if not base_name.lower().endswith(".mp4"):
@@ -249,7 +248,6 @@ def render(req: RenderRequest):
         final_path = out_dir / base_name
         _concat_videos(scene_mp4_paths, final_path)
 
-        # If user wants file directly
         if req.return_file:
             return FileResponse(
                 path=str(final_path),
@@ -257,7 +255,6 @@ def render(req: RenderRequest):
                 filename=base_name,
             )
 
-        # else upload to GCS if configured, otherwise return local path (for debugging)
         if GCS_BUCKET:
             url = _upload_to_gcs(final_path, base_name)
             return {"ok": True, "project_id": req.project_id, "output_url": url, "file": base_name}
@@ -271,7 +268,6 @@ def render(req: RenderRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     finally:
-        # cleanup
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -280,4 +276,5 @@ def render(req: RenderRequest):
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # ใช้ "main:app" ให้ชัวร์บน Railway (กันบางกรณี import context)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)

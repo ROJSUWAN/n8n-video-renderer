@@ -13,39 +13,36 @@ from typing import List, Optional
 import requests
 import edge_tts
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-# Optional: GCS upload
+# -----------------------------
+# Google Cloud Storage Setup
+# -----------------------------
 try:
-    from google.cloud import storage  # type: ignore
-except Exception:
+    from google.cloud import storage
+except ImportError:
     storage = None
 
 # -----------------------------
-# Config
+# Config & Environment Variables
 # -----------------------------
-APP_NAME = "n8n-video-renderer-v2"
-
+APP_NAME = "n8n-video-renderer-pro"
 DEFAULT_FPS = int(os.getenv("VIDEO_FPS", "30"))
 DEFAULT_WIDTH = int(os.getenv("VIDEO_WIDTH", "1080"))
 DEFAULT_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1920"))
 
-# GCS Config จาก Railway Variables
 GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
 GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
 GCS_PUBLIC = os.getenv("GCS_PUBLIC", "false").lower() in ("1", "true", "yes")
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
-PORT = int(os.environ.get("PORT", "8080"))
-
 app = FastAPI(title=APP_NAME)
 
 # -----------------------------
-# Models
+# Models (ข้อมูลที่รับจาก n8n)
 # -----------------------------
 class SceneItem(BaseModel):
-    scene_number: int = Field(..., ge=1)
+    scene_number: int
     script: str
     image_base64: str
 
@@ -53,125 +50,102 @@ class RenderRequest(BaseModel):
     stock_symbol: str = "UNKNOWN"
     trade_setup: dict = {}
     data: List[SceneItem]
-    output_name: Optional[str] = None
-    return_file: Optional[bool] = False
 
 # -----------------------------
-# Helpers & Processing
+# Video Processing Functions
 # -----------------------------
-def _run(cmd: List[str]) -> None:
+def _run_ffmpeg(cmd: List[str]):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg Error: {proc.stderr}")
 
-def _save_base64_image(b64_str: str, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(base64.b64decode(b64_str))
-
-async def _generate_audio(text: str, out_path: Path, voice: str = "th-TH-PremwadeeNeural") -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(str(out_path))
-
-def _build_scene(image_in: Path, audio_in: Path, out_path: Path) -> None:
-    vf = f"scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}"
-    cmd = [
-        "ffmpeg", "-y", "-loop", "1", "-framerate", str(DEFAULT_FPS),
-        "-i", str(image_in), "-i", str(audio_in),
-        "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-shortest", str(out_path)
-    ]
-    _run(cmd)
-
-def _concat_videos(scene_paths: List[Path], out_path: Path) -> None:
-    list_file = out_path.parent / "concat_list.txt"
-    content = "\n".join([f"file '{str(p.absolute())}'" for p in scene_paths])
-    list_file.write_text(content)
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out_path)]
-    _run(cmd)
-
-# -----------------------------
-# GCS Upload Logic
-# -----------------------------
-def _upload_to_gcs(local_path: Path, filename: str) -> str:
-    if not storage or not GCS_BUCKET:
-        return "GCS_NOT_CONFIGURED"
-    
-    try:
-        if GCP_SA_JSON:
-            client = storage.Client.from_service_account_info(json.loads(GCP_SA_JSON))
-        else:
-            client = storage.Client()
-            
-        bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(f"{GCS_PREFIX}{filename}")
-        blob.upload_from_filename(str(local_path))
-        
-        if GCS_PUBLIC:
-            blob.make_public()
-            return blob.public_url
-        return blob.generate_signed_url(expiration=3600)
-    except Exception as e:
-        print(f"GCS Upload Error: {e}")
-        return f"UPLOAD_ERROR: {str(e)}"
-
-# -----------------------------
-# Core Background Processor
-# -----------------------------
-async def processing_task(req: RenderRequest):
+async def render_video_task(req: RenderRequest):
+    """ฟังก์ชันหลักที่ทำงานเบื้องหลัง (Background Task)"""
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
     try:
         assets_dir = workdir / "assets"
         scenes_dir = workdir / "scenes"
         assets_dir.mkdir(parents=True); scenes_dir.mkdir(parents=True)
 
-        scene_paths = []
+        scene_mp4s = []
+        # เรียงลำดับฉาก 1-6
         scenes = sorted(req.data, key=lambda s: s.scene_number)
 
         for s in scenes:
-            img = assets_dir / f"{s.scene_number}.png"
-            aud = assets_dir / f"{s.scene_number}.mp3"
-            scp = scenes_dir / f"{s.scene_number}.mp4"
+            img_p = assets_dir / f"{s.scene_number}.png"
+            aud_p = assets_dir / f"{s.scene_number}.mp3"
+            scn_p = scenes_dir / f"{s.scene_number}.mp4"
+
+            # 1. Save Image
+            with open(img_p, "wb") as f:
+                f.write(base64.b64decode(s.image_base64))
+
+            # 2. Generate Audio (Thai Voice)
+            tts = edge_tts.Communicate(s.script, "th-TH-PremwadeeNeural")
+            await tts.save(str(aud_p))
+
+            # 3. Build Scene Video
+            vf = (f"scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,"
+                  f"pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}")
+            cmd = [
+                "ffmpeg", "-y", "-loop", "1", "-framerate", str(DEFAULT_FPS),
+                "-i", str(img_p), "-i", str(aud_p),
+                "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-shortest", str(scn_p)
+            ]
+            _run_ffmpeg(cmd)
+            scene_mp4s.append(scn_p)
+
+        # 4. Concat all scenes
+        final_name = f"{req.stock_symbol}_{uuid.uuid4().hex[:6]}.mp4"
+        final_path = workdir / final_name
+        list_p = workdir / "list.txt"
+        list_p.write_text("\n".join([f"file '{str(p.absolute())}'" for p in scene_mp4s]))
+        
+        _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_p), "-c", "copy", str(final_path)])
+
+        # 5. Upload to Google Cloud Storage
+        if storage and GCS_BUCKET:
+            if GCP_SA_JSON:
+                client = storage.Client.from_service_account_info(json.loads(GCP_SA_JSON))
+            else:
+                client = storage.Client()
             
-            _save_base64_image(s.image_base64, img)
-            await _generate_audio(s.script, aud)
-            _build_scene(img, aud, scp)
-            scene_paths.append(scp)
+            bucket = client.bucket(GCS_BUCKET)
+            blob = bucket.blob(f"{GCS_PREFIX}{final_name}")
+            blob.upload_from_filename(str(final_path))
+            
+            if GCS_PUBLIC:
+                blob.make_public()
+            print(f"Successfully uploaded: {final_name}")
 
-        filename = f"{req.stock_symbol}_{uuid.uuid4().hex[:6]}.mp4"
-        final_video = workdir / filename
-        _concat_videos(scene_paths, final_video)
-
-        # อัปโหลดขึ้น Google Cloud
-        url = _upload_to_gcs(final_video, filename)
-        print(f"DONE: {req.stock_symbol} -> {url}")
-        
-        # ตรงนี้คุณสามารถเพิ่มคำสั่งส่ง LINE Notify เพื่อบอกตัวเองว่าเสร็จแล้วได้ครับ
-        
     except Exception as e:
-        print(f"Background Process Error for {req.stock_symbol}: {e}")
+        print(f"Error rendering {req.stock_symbol}: {e}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 # -----------------------------
-# Main Route
+# API Endpoints
 # -----------------------------
 @app.post("/render")
-async def render(req: RenderRequest, background_tasks: BackgroundTasks):
+async def create_render_job(req: RenderRequest, background_tasks: BackgroundTasks):
     if not req.data:
-        raise HTTPException(status_code=400, detail="Data is empty")
+        raise HTTPException(status_code=400, detail="No scene data provided")
 
-    # สั่งให้ทำงานเบื้องหลังทันที
-    background_tasks.add_task(processing_task, req)
+    # สั่งให้เรนเดอร์เบื้องหลังทันที
+    background_tasks.add_task(render_video_task, req)
 
-    # ตอบกลับ n8n ทันทีว่าได้รับงานแล้ว
+    # ตอบกลับ n8n ทันที (ใช้เวลาไม่ถึง 1 วินาที)
     return {
-        "ok": True,
-        "message": f"Rendering {req.stock_symbol} in background. Check your GCS Bucket in 3-5 mins.",
+        "status": "accepted",
+        "message": f"Rendering job for {req.stock_symbol} started.",
         "bucket": GCS_BUCKET
     }
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

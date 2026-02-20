@@ -200,14 +200,39 @@ async def render_video_task(req: RenderRequest):
         scene_mp4s = []
         scenes = sorted(req.data, key=lambda s: s.scene_number)
 
+        # ----------------------------------------------------
+        # 📌 ตัวแปรจำรูปภาพล่าสุด (เผื่อฉากต่อไป error จะได้ดึงไปใช้)
+        # ----------------------------------------------------
+        last_valid_image = None
+
         for s in scenes:
             print(f"\n⏳ [SCENE {s.scene_number}] กำลังประมวลผล...", flush=True)
             img_p = assets_dir / f"{s.scene_number}.png"
             aud_p = assets_dir / f"{s.scene_number}.mp3"
             scn_p = scenes_dir / f"{s.scene_number}.mp4"
 
-            with open(img_p, "wb") as f:
-                f.write(base64.b64decode(s.image_base64))
+            # --- จัดการรูปภาพ (มีระบบ Fallback ถ้าภาพ Error) ---
+            try:
+                img_data = base64.b64decode(s.image_base64)
+                with open(img_p, "wb") as f:
+                    f.write(img_data)
+                
+                # โหลดสำเร็จ จดจำไว้เป็นตัวสำรอง
+                last_valid_image = img_p 
+
+            except Exception as e:
+                print(f"⚠️ [SCENE {s.scene_number}] รูปภาพมีปัญหา: {e}", flush=True)
+                
+                # เช็คว่ามีรูปจากฉากก่อนหน้าให้ดึงมาใช้ไหม?
+                if last_valid_image and last_valid_image.exists():
+                    print(f"   -> ดึงรูปจากฉากก่อนหน้า ({last_valid_image.name}) มาใช้แทน...", flush=True)
+                    shutil.copy(last_valid_image, img_p)
+                else:
+                    # ถ้าพังตั้งแต่ฉากแรก (ไม่มีรูปก่อนหน้า) ถึงจะยอมใช้จอดำ
+                    print(f"   -> ไม่มีรูปก่อนหน้าให้ดึง สร้างภาพสีดำแทนที่...", flush=True)
+                    Image.new('RGB', (DEFAULT_WIDTH, DEFAULT_HEIGHT), color='black').save(img_p)
+                    last_valid_image = img_p
+            # ------------------------------------------------
 
             tts = edge_tts.Communicate(s.script, "th-TH-PremwadeeNeural")
             await tts.save(str(aud_p))

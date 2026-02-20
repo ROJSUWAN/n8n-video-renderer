@@ -41,26 +41,19 @@ GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 app = FastAPI(title=APP_NAME)
 
 # -----------------------------
-# 🚨 ตัวดักจับ 422 Error เพื่อแฉลง Logs ใน Railway 🚨
+# 🚨 ตัวดักจับ 422 Error
 # -----------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    print("\n" + "="*50)
-    print("🚨 เกิด Error 422: ข้อมูลที่ n8n ส่งมาไม่ตรงกับที่ Python รอรับ 🚨")
-    print("จุดที่ผิดพลาด (เอาไปแก้ใน n8n):")
+    print("\n" + "="*50, flush=True)
+    print("🚨 เกิด Error 422: ข้อมูลที่ n8n ส่งมาไม่ตรง 🚨", flush=True)
     for error in exc.errors():
-        print(f"  -> ตำแหน่ง (Location): {error.get('loc')}")
-        print(f"  -> ปัญหา (Message): {error.get('msg')}")
-        print(f"  -> ชนิด (Type): {error.get('type')}")
-    print("="*50 + "\n")
-    
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors(), "body": exc.body},
-    )
+        print(f"  -> ตำแหน่ง: {error.get('loc')} | ปัญหา: {error.get('msg')}", flush=True)
+    print("="*50 + "\n", flush=True)
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # -----------------------------
-# Models (ข้อมูลที่รับจาก n8n)
+# Models
 # -----------------------------
 class SceneItem(BaseModel):
     scene_number: int
@@ -78,34 +71,44 @@ class RenderRequest(BaseModel):
 def _run_ffmpeg(cmd: List[str]):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
+        print(f"❌ [FFMPEG ERROR]: {proc.stderr}", flush=True)
         raise RuntimeError(f"FFmpeg Error: {proc.stderr}")
 
 async def render_video_task(req: RenderRequest):
-    """ฟังก์ชันหลักที่ทำงานเบื้องหลัง (Background Task)"""
+    """ฟังก์ชันหลักที่ทำงานเบื้องหลัง พร้อมพ่น Log ทุกขั้นตอน"""
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
+    total_scenes = len(req.data)
+    
+    print(f"\n🎬 [START] เริ่มต้นงานเรนเดอร์วิดีโอหุ้น: {req.stock_symbol} จำนวน {total_scenes} ฉาก", flush=True)
+    print(f"📁 สร้างพื้นที่ทำงานชั่วคราว: {workdir}", flush=True)
+    
     try:
         assets_dir = workdir / "assets"
         scenes_dir = workdir / "scenes"
         assets_dir.mkdir(parents=True); scenes_dir.mkdir(parents=True)
 
         scene_mp4s = []
-        # เรียงลำดับฉาก 1-6
         scenes = sorted(req.data, key=lambda s: s.scene_number)
 
         for s in scenes:
+            print(f"\n⏳ [SCENE {s.scene_number}/{total_scenes}] เริ่มประมวลผลฉากที่ {s.scene_number}...", flush=True)
+            
             img_p = assets_dir / f"{s.scene_number}.png"
             aud_p = assets_dir / f"{s.scene_number}.mp3"
             scn_p = scenes_dir / f"{s.scene_number}.mp4"
 
             # 1. Save Image
+            print(f"   -> 🖼️ กำลังบันทึกรูปภาพ...", flush=True)
             with open(img_p, "wb") as f:
                 f.write(base64.b64decode(s.image_base64))
 
             # 2. Generate Audio (Thai Voice)
+            print(f"   -> 🎙️ กำลังดึงเสียงพากย์ AI (TTS)...", flush=True)
             tts = edge_tts.Communicate(s.script, "th-TH-PremwadeeNeural")
             await tts.save(str(aud_p))
 
             # 3. Build Scene Video
+            print(f"   -> 🎞️ กำลังเรนเดอร์ประกอบภาพและเสียง (FFmpeg)...", flush=True)
             vf = (f"scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,"
                   f"pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}")
             cmd = [
@@ -116,16 +119,20 @@ async def render_video_task(req: RenderRequest):
             ]
             _run_ffmpeg(cmd)
             scene_mp4s.append(scn_p)
+            print(f"   ✅ ฉากที่ {s.scene_number} เสร็จสมบูรณ์!", flush=True)
 
         # 4. Concat all scenes
+        print(f"\n🔗 [CONCAT] กำลังรวมวิดีโอทั้ง {total_scenes} ฉากเข้าด้วยกัน...", flush=True)
         final_name = f"{req.stock_symbol}_{uuid.uuid4().hex[:6]}.mp4"
         final_path = workdir / final_name
         list_p = workdir / "list.txt"
         list_p.write_text("\n".join([f"file '{str(p.absolute())}'" for p in scene_mp4s]))
         
         _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_p), "-c", "copy", str(final_path)])
+        print(f"✅ [CONCAT] รวมไฟล์เสร็จสมบูรณ์ -> {final_name}", flush=True)
 
         # 5. Upload to Google Cloud Storage
+        print(f"\n☁️ [UPLOAD] กำลังอัปโหลดขึ้น Google Cloud Storage (Bucket: {GCS_BUCKET})...", flush=True)
         if storage and GCS_BUCKET:
             if GCP_SA_JSON:
                 client = storage.Client.from_service_account_info(json.loads(GCP_SA_JSON))
@@ -138,12 +145,17 @@ async def render_video_task(req: RenderRequest):
             
             if GCS_PUBLIC:
                 blob.make_public()
-            print(f"Successfully uploaded: {final_name}")
+            print(f"🎉 [SUCCESS] อัปโหลดสำเร็จ! วิดีโอของคุณพร้อมใช้งานแล้ว", flush=True)
+            print(f"🌐 URL: https://storage.googleapis.com/{GCS_BUCKET}/{GCS_PREFIX}{final_name}\n", flush=True)
+        else:
+            print("⚠️ [WARNING] ข้ามการอัปโหลด GCS เนื่องจากไม่ได้ตั้งค่าตัวแปร GCS_BUCKET", flush=True)
 
     except Exception as e:
-        print(f"Error rendering {req.stock_symbol}: {e}")
+        print(f"\n❌ [ERROR] เกิดข้อผิดพลาดร้ายแรงระหว่างเรนเดอร์หุ้น {req.stock_symbol}: {str(e)}\n", flush=True)
     finally:
+        print("🧹 [CLEANUP] ลบไฟล์ชั่วคราวทิ้งเพื่อคืนพื้นที่ให้เซิร์ฟเวอร์...", flush=True)
         shutil.rmtree(workdir, ignore_errors=True)
+        print("="*50 + "\n", flush=True)
 
 # -----------------------------
 # API Endpoints
@@ -156,7 +168,7 @@ async def create_render_job(req: RenderRequest, background_tasks: BackgroundTask
     # สั่งให้เรนเดอร์เบื้องหลังทันที
     background_tasks.add_task(render_video_task, req)
 
-    # ตอบกลับ n8n ทันที (ใช้เวลาไม่ถึง 1 วินาที)
+    print(f"📩 [API] ได้รับคำสั่งเรนเดอร์หุ้น {req.stock_symbol} ตอบ 200 OK ให้ n8n กลับไปทำงานต่อ", flush=True)
     return {
         "status": "accepted",
         "message": f"Rendering job for {req.stock_symbol} started.",

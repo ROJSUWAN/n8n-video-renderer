@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
-# 👉 นำเข้าไลบรารีสำหรับสร้างภาพซับไตเติ้ล (จากโค้ดเก่า)
+# 👉 ไลบรารีสำหรับสร้างภาพซับไตเติ้ล
 from PIL import Image, ImageDraw, ImageFont
 
 # -----------------------------
@@ -38,7 +38,6 @@ DEFAULT_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1920"))
 
 GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
 GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
-GCS_PUBLIC = os.getenv("GCS_PUBLIC", "false").lower() in ("1", "true", "yes")
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
 # กำหนดชื่อไฟล์โลโก้
@@ -72,21 +71,36 @@ class RenderRequest(BaseModel):
     data: List[SceneItem]
 
 # -----------------------------
-# 🔤 Subtitle Generation Functions (ยกมาจากโค้ดเก่า)
+# 🔤 Subtitle Generation Functions
 # -----------------------------
+FONT_PATH = "Sarabun-Bold.ttf"
+FONT_URL = "https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf"
+
 def get_font(fontsize):
-    font_names = ["tahoma.ttf", "arial.ttf", "NotoSansThai-Regular.ttf"]
-    for name in font_names:
-        if os.path.exists(name): return ImageFont.truetype(name, fontsize)
-    linux_paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
-    for path in linux_paths:
-        if os.path.exists(path): return ImageFont.truetype(path, fontsize)
-    return ImageFont.load_default()
+    """โหลดฟอนต์ภาษาไทยอัตโนมัติจาก Google Fonts"""
+    # 1. เช็คว่ามีไฟล์ฟอนต์บนเซิร์ฟเวอร์หรือยัง ถ้ายังให้ดาวน์โหลด
+    if not os.path.exists(FONT_PATH):
+        print(f"📥 กำลังดาวน์โหลดฟอนต์ภาษาไทย ({FONT_PATH})...", flush=True)
+        try:
+            r = requests.get(FONT_URL, allow_redirects=True, timeout=15)
+            with open(FONT_PATH, 'wb') as f:
+                f.write(r.content)
+            print(f"✅ ดาวน์โหลดฟอนต์สำเร็จ!", flush=True)
+        except Exception as e:
+            print(f"❌ โหลดฟอนต์ไม่สำเร็จ: {e}", flush=True)
+            return ImageFont.load_default()
+    
+    # 2. นำฟอนต์มาใช้งาน
+    try:
+        return ImageFont.truetype(FONT_PATH, fontsize)
+    except Exception as e:
+        print(f"❌ ข้อผิดพลาดในการอ่านฟอนต์: {e}", flush=True)
+        return ImageFont.load_default()
 
 def create_subtitle_image(text, out_path, width=1080, height=1920):
     """สร้างภาพ PNG ซับไตเติ้ลพื้นหลังโปร่งใส เพื่อนำไปซ้อนในวิดีโอ"""
     try:
-        scale_factor = width / 720.0 # คำนวณ Scale จากโค้ดเก่าที่ทำไว้สำหรับ 720p
+        scale_factor = width / 720.0 
         img = Image.new('RGBA', (width, height), (0,0,0,0))
         draw = ImageDraw.Draw(img)
         
@@ -115,10 +129,10 @@ def create_subtitle_image(text, out_path, width=1080, height=1920):
         
         cur_y = start_y
         for line in lines:
-            try: # Pillow >= 10.0
+            try: # รองรับ Pillow เวอร์ชั่นใหม่
                 bbox = draw.textbbox((0, 0), line, font=font)
                 text_width = bbox[2] - bbox[0]
-            except AttributeError: # Pillow < 10.0
+            except AttributeError: # รองรับ Pillow เวอร์ชั่นเก่า
                 text_width, _ = draw.textsize(line, font=font)
                 
             x = (width - text_width) / 2
@@ -131,7 +145,6 @@ def create_subtitle_image(text, out_path, width=1080, height=1920):
         img.save(out_path)
     except Exception as e:
         print(f"❌ [SUBTITLE ERROR]: {e}", flush=True)
-        # ถ้าพังให้สร้างภาพเปล่าๆ วิดีโอจะได้ไม่พัง
         Image.new('RGBA', (width, height), (0,0,0,0)).save(out_path)
 
 # -----------------------------
@@ -144,7 +157,7 @@ def _run_ffmpeg(cmd: List[str]):
         raise RuntimeError(f"FFmpeg Error: {proc.stderr}")
 
 async def render_video_task(req: RenderRequest):
-    """ฟังก์ชันหลักที่ทำงานเบื้องหลัง พร้อมพ่น Log ทุกขั้นตอน"""
+    """ฟังก์ชันหลักที่ทำงานเบื้องหลัง"""
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
     total_scenes = len(req.data)
     has_logo = os.path.exists(LOGO_PATH)
@@ -179,7 +192,7 @@ async def render_video_task(req: RenderRequest):
             await tts.save(str(aud_p))
             
             # 3. Generate Subtitle Image
-            print(f"   -> 🔤 กำลังสร้างภาพซับไตเติ้ล...", flush=True)
+            print(f"   -> 🔤 กำลังสร้างภาพซับไตเติ้ลภาษาไทย...", flush=True)
             create_subtitle_image(s.script, str(sub_p), width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT)
 
             # 4. Build Scene Video (FFmpeg + Filters)
@@ -198,12 +211,12 @@ async def render_video_task(req: RenderRequest):
             
             if has_logo:
                 cmd.extend(["-i", LOGO_PATH])
-                logo_width = int(200 * (DEFAULT_WIDTH / 720.0)) # ปรับขนาดสัดส่วนเดียวกับโค้ดเก่า
-                fc_parts.append(f"[bg][2:v]overlay=0:0[with_sub]") # ซ้อนซับทับภาพหลัก
-                fc_parts.append(f"[3:v]scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]") # ย่อและทำโปร่งแสงโลโก้ 90%
-                fc_parts.append(f"[with_sub][logo]overlay=W-w-30:30[final_v]") # วางมุมขวาบน (ห่างขอบ 30px)
+                logo_width = int(200 * (DEFAULT_WIDTH / 720.0))
+                fc_parts.append(f"[bg][2:v]overlay=0:0[with_sub]")
+                fc_parts.append(f"[3:v]scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
+                fc_parts.append(f"[with_sub][logo]overlay=W-w-30:30[final_v]")
             else:
-                fc_parts.append(f"[bg][2:v]overlay=0:0[final_v]") # ถ้าไม่มีโลโก้ ซ้อนแค่ซับ
+                fc_parts.append(f"[bg][2:v]overlay=0:0[final_v]")
                 
             filter_complex = ";".join(fc_parts)
             
@@ -261,7 +274,6 @@ async def create_render_job(req: RenderRequest, background_tasks: BackgroundTask
     if not req.data:
         raise HTTPException(status_code=400, detail="No scene data provided")
 
-    # สั่งให้เรนเดอร์เบื้องหลังทันที
     background_tasks.add_task(render_video_task, req)
 
     print(f"📩 [API] ได้รับคำสั่งเรนเดอร์หุ้น {req.stock_symbol} ตอบ 200 OK ให้ n8n กลับไปทำงานต่อ", flush=True)

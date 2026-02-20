@@ -12,7 +12,9 @@ from typing import List, Optional
 
 import requests
 import edge_tts
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 # -----------------------------
@@ -37,6 +39,25 @@ GCS_PUBLIC = os.getenv("GCS_PUBLIC", "false").lower() in ("1", "true", "yes")
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
 app = FastAPI(title=APP_NAME)
+
+# -----------------------------
+# 🚨 ตัวดักจับ 422 Error เพื่อแฉลง Logs ใน Railway 🚨
+# -----------------------------
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print("\n" + "="*50)
+    print("🚨 เกิด Error 422: ข้อมูลที่ n8n ส่งมาไม่ตรงกับที่ Python รอรับ 🚨")
+    print("จุดที่ผิดพลาด (เอาไปแก้ใน n8n):")
+    for error in exc.errors():
+        print(f"  -> ตำแหน่ง (Location): {error.get('loc')}")
+        print(f"  -> ปัญหา (Message): {error.get('msg')}")
+        print(f"  -> ชนิด (Type): {error.get('type')}")
+    print("="*50 + "\n")
+    
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
 
 # -----------------------------
 # Models (ข้อมูลที่รับจาก n8n)

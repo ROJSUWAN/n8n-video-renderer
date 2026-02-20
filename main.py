@@ -38,10 +38,6 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
 GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
 
-# 👉 แก้ปัญหาที่ 2: โลโก้ไม่ขึ้น (บังคับหา Path ปัจจุบัน)
-BASE_DIR = Path(__file__).resolve().parent
-LOGO_PATH = BASE_DIR / "my_logo.png"
-
 app = FastAPI(title=APP_NAME)
 
 @app.exception_handler(RequestValidationError)
@@ -64,7 +60,7 @@ class RenderRequest(BaseModel):
     data: List[SceneItem]
 
 # -----------------------------
-# 🔤 Subtitle & Thai Word Wrap (แก้ปัญหา 3 และ 4)
+# 🔤 Subtitle & Thai Word Wrap
 # -----------------------------
 FONT_PATH = "Sarabun-Bold.ttf"
 FONT_URL = "https://github.com/google/fonts/raw/main/ofl/sarabun/Sarabun-Bold.ttf"
@@ -87,7 +83,7 @@ def wrap_and_chunk_thai_text(text, max_chars_per_line=32, max_lines=3):
         from pythainlp.tokenize import word_tokenize
         words = word_tokenize(text, engine="newmm")
     except ImportError:
-        words = list(text) # Fallback ถ้าลืมลง pythainlp
+        words = list(text)
 
     chunks = []
     current_chunk = []
@@ -126,7 +122,6 @@ def create_subtitle_image(text_chunk, out_path, width=1080, height=1920):
         start_y = int(150 * scale_factor)
         rect_padding = int(15 * scale_factor)
         
-        # พื้นหลังดำโปร่งแสง
         draw.rectangle(
             [20 * scale_factor, start_y - rect_padding, width - (20 * scale_factor), start_y + total_height + rect_padding], 
             fill=(0,0,0,160)
@@ -152,16 +147,15 @@ def create_subtitle_image(text_chunk, out_path, width=1080, height=1920):
         Image.new('RGBA', (width, height), (0,0,0,0)).save(out_path)
 
 # -----------------------------
-# 🎬 Video Processing (แก้ปัญหา 1)
+# 🎬 Video Processing
 # -----------------------------
 def get_audio_duration(file_path):
-    """ดึงความยาวเสียงแบบเป๊ะๆ เพื่อแก้ปัญหาภาพเหลื่อมเสียง"""
     try:
         cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
         return float(result.stdout.strip())
     except:
-        return 10.0 # Fallback
+        return 10.0 
 
 def _run_ffmpeg(cmd: List[str]):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -171,9 +165,18 @@ def _run_ffmpeg(cmd: List[str]):
 async def render_video_task(req: RenderRequest):
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
     total_scenes = len(req.data)
-    has_logo = LOGO_PATH.exists()
     
-    print(f"\n🎬 [START] เริ่มเรนเดอร์หุ้น {req.stock_symbol} | เจอโลโก้ไหม?: {has_logo}", flush=True)
+    # 🔥 ค้นหาไฟล์โลโก้แบบกวาดทุก Path
+    possible_logo_paths = [Path("my_logo.png"), Path(__file__).resolve().parent / "my_logo.png"]
+    logo_actual_path = None
+    for p in possible_logo_paths:
+        if p.exists():
+            logo_actual_path = p
+            break
+            
+    has_logo = logo_actual_path is not None
+    
+    print(f"\n🎬 [START] เริ่มเรนเดอร์หุ้น {req.stock_symbol} | เจอโลโก้ไหม?: {has_logo} ({logo_actual_path})", flush=True)
     
     try:
         assets_dir = workdir / "assets"
@@ -192,14 +195,10 @@ async def render_video_task(req: RenderRequest):
             with open(img_p, "wb") as f:
                 f.write(base64.b64decode(s.image_base64))
 
-            # ดึงเสียง
             tts = edge_tts.Communicate(s.script, "th-TH-PremwadeeNeural")
             await tts.save(str(aud_p))
-            
-            # ดึงความยาวเสียงเป๊ะๆ
             duration = get_audio_duration(aud_p)
             
-            # หั่นและสร้างซับไตเติ้ล
             chunks = wrap_and_chunk_thai_text(s.script, max_chars_per_line=32, max_lines=3)
             total_chars = max(sum(len(c.replace('\n', '')) for c in chunks), 1)
             
@@ -237,10 +236,11 @@ async def render_video_task(req: RenderRequest):
             fc_parts.extend(sub_filters)
             
             if has_logo:
-                cmd.extend(["-i", str(LOGO_PATH)])
+                cmd.extend(["-i", str(logo_actual_path)])
                 logo_idx = 2 + len(chunks)
                 logo_width = int(200 * (DEFAULT_WIDTH / 720.0))
-                fc_parts.append(f"[{logo_idx}:v]scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
+                # 🔥 บังคับ format=rgba เพื่อดึงความโปร่งใส ป้องกันไฟล์ PNG มีปัญหา
+                fc_parts.append(f"[{logo_idx}:v]format=rgba,scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
                 fc_parts.append(f"[final_sub][logo]overlay=W-w-30:30[final_v]")
 
             filter_complex = ";".join(fc_parts)
@@ -251,7 +251,7 @@ async def render_video_task(req: RenderRequest):
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "23", 
                 "-c:a", "aac", "-b:a", "128k",
                 "-r", str(DEFAULT_FPS),
-                "-t", str(duration), # แก้ภาพเหลื่อมเสียง (บังคับตัดเป๊ะๆ)
+                "-t", str(duration), 
                 str(scn_p)
             ])
             _run_ffmpeg(cmd)

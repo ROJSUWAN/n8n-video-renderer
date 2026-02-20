@@ -60,6 +60,28 @@ class RenderRequest(BaseModel):
     data: List[SceneItem]
 
 # -----------------------------
+# 🖼️ Auto-Download Logo
+# -----------------------------
+LOGO_PATH = "my_logo.png"
+# ลิงก์ตรงดึงไฟล์โลโก้จาก GitHub ของคุณตั้มโดยตรง
+LOGO_URL = "https://raw.githubusercontent.com/ROJSUWAN/n8n-video-renderer/main/my_logo.png"
+
+def setup_logo():
+    if not os.path.exists(LOGO_PATH):
+        print("📥 กำลังดาวน์โหลดโลโก้จาก GitHub...", flush=True)
+        try:
+            r = requests.get(LOGO_URL, timeout=15)
+            if r.status_code == 200:
+                with open(LOGO_PATH, 'wb') as f:
+                    f.write(r.content)
+                print("✅ โหลดโลโก้สำเร็จ!", flush=True)
+            else:
+                print(f"❌ โหลดโลโก้ไม่ได้ (Status: {r.status_code})", flush=True)
+        except Exception as e:
+            print(f"❌ โหลดโลโก้ไม่สำเร็จ: {e}", flush=True)
+    return os.path.exists(LOGO_PATH)
+
+# -----------------------------
 # 🔤 Subtitle & Thai Word Wrap
 # -----------------------------
 FONT_PATH = "Sarabun-Bold.ttf"
@@ -78,7 +100,6 @@ def get_font(fontsize):
         return ImageFont.load_default()
 
 def wrap_and_chunk_thai_text(text, max_chars_per_line=32, max_lines=3):
-    """ตัดคำไทยให้สวยงาม และหั่นซับไตเติ้ลเป็นท่อนๆ (ท่อนละไม่เกิน 3 บรรทัด)"""
     try:
         from pythainlp.tokenize import word_tokenize
         words = word_tokenize(text, engine="newmm")
@@ -166,17 +187,10 @@ async def render_video_task(req: RenderRequest):
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
     total_scenes = len(req.data)
     
-    # 🔥 ค้นหาไฟล์โลโก้แบบกวาดทุก Path
-    possible_logo_paths = [Path("my_logo.png"), Path(__file__).resolve().parent / "my_logo.png"]
-    logo_actual_path = None
-    for p in possible_logo_paths:
-        if p.exists():
-            logo_actual_path = p
-            break
-            
-    has_logo = logo_actual_path is not None
+    # 💥 สั่งดึงโลโก้จาก GitHub
+    has_logo = setup_logo()
     
-    print(f"\n🎬 [START] เริ่มเรนเดอร์หุ้น {req.stock_symbol} | เจอโลโก้ไหม?: {has_logo} ({logo_actual_path})", flush=True)
+    print(f"\n🎬 [START] เริ่มเรนเดอร์หุ้น {req.stock_symbol} | เจอโลโก้ไหม?: {has_logo}", flush=True)
     
     try:
         assets_dir = workdir / "assets"
@@ -236,10 +250,10 @@ async def render_video_task(req: RenderRequest):
             fc_parts.extend(sub_filters)
             
             if has_logo:
-                cmd.extend(["-i", str(logo_actual_path)])
+                cmd.extend(["-i", LOGO_PATH])
                 logo_idx = 2 + len(chunks)
                 logo_width = int(200 * (DEFAULT_WIDTH / 720.0))
-                # 🔥 บังคับ format=rgba เพื่อดึงความโปร่งใส ป้องกันไฟล์ PNG มีปัญหา
+                # ใส่ format=rgba ให้โปร่งแสง
                 fc_parts.append(f"[{logo_idx}:v]format=rgba,scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
                 fc_parts.append(f"[final_sub][logo]overlay=W-w-30:30[final_v]")
 

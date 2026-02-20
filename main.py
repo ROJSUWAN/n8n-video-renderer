@@ -271,7 +271,17 @@ async def render_video_task(req: RenderRequest):
             
             cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", str(DEFAULT_FPS), "-i", str(img_p), "-i", str(aud_p)] + sub_inputs
             
-            fc_parts = [f"[0:v]scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}[bg]"]
+            # --- แก้ไข: ใช้ภาพพื้นหลังแบบเบลอแทนการเติมขอบดำ ---
+            fc_parts = [
+                # 1. เอาภาพมาขยายสัดส่วนให้เต็มจอแล้วใส่ฟิลเตอร์เบลอ (boxblur)
+                f"[0:v]scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=increase,crop={DEFAULT_WIDTH}:{DEFAULT_HEIGHT},boxblur=40:40[bg_blur]",
+                # 2. ปรับขนาดภาพหลักให้พอดีเฟรม (ไม่เสียสัดส่วน)
+                f"[0:v]scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease[fg]",
+                # 3. จับภาพหลัก (fg) วางทับบนพื้นหลังเบลอ (bg_blur)
+                f"[bg_blur][fg]overlay=(W-w)/2:(H-h)/2,fps={DEFAULT_FPS}[bg]"
+            ]
+            # ---------------------------------------------------
+            
             fc_parts.extend(sub_filters)
             
             if has_logo:

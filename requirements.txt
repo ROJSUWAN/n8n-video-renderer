@@ -4,3 +4,4 @@ pydantic
 requests
 edge-tts
 google-cloud-storage
+pillow<10.0.0

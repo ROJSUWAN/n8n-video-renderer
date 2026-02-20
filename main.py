@@ -17,6 +17,9 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
+# 👉 นำเข้าไลบรารีสำหรับสร้างภาพซับไตเติ้ล (จากโค้ดเก่า)
+from PIL import Image, ImageDraw, ImageFont
+
 # -----------------------------
 # Google Cloud Storage Setup
 # -----------------------------
@@ -37,6 +40,9 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
 GCS_PREFIX = os.getenv("GCS_PREFIX", "renders/").strip()
 GCS_PUBLIC = os.getenv("GCS_PUBLIC", "false").lower() in ("1", "true", "yes")
 GCP_SA_JSON = os.getenv("GCP_SA_JSON", "").strip()
+
+# กำหนดชื่อไฟล์โลโก้
+LOGO_PATH = "my_logo.png"
 
 app = FastAPI(title=APP_NAME)
 
@@ -66,6 +72,69 @@ class RenderRequest(BaseModel):
     data: List[SceneItem]
 
 # -----------------------------
+# 🔤 Subtitle Generation Functions (ยกมาจากโค้ดเก่า)
+# -----------------------------
+def get_font(fontsize):
+    font_names = ["tahoma.ttf", "arial.ttf", "NotoSansThai-Regular.ttf"]
+    for name in font_names:
+        if os.path.exists(name): return ImageFont.truetype(name, fontsize)
+    linux_paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
+    for path in linux_paths:
+        if os.path.exists(path): return ImageFont.truetype(path, fontsize)
+    return ImageFont.load_default()
+
+def create_subtitle_image(text, out_path, width=1080, height=1920):
+    """สร้างภาพ PNG ซับไตเติ้ลพื้นหลังโปร่งใส เพื่อนำไปซ้อนในวิดีโอ"""
+    try:
+        scale_factor = width / 720.0 # คำนวณ Scale จากโค้ดเก่าที่ทำไว้สำหรับ 720p
+        img = Image.new('RGBA', (width, height), (0,0,0,0))
+        draw = ImageDraw.Draw(img)
+        
+        font_size = int(28 * scale_factor)
+        font = get_font(font_size)
+        
+        limit_chars = 40
+        lines = []
+        temp = ""
+        for char in text:
+            if len(temp) < limit_chars: temp += char
+            else: lines.append(temp); temp = char
+        if temp: lines.append(temp)
+        
+        line_height = font_size + int(10 * scale_factor)
+        total_height = len(lines) * line_height
+        
+        start_y = int(150 * scale_factor) # ตำแหน่งด้านบน
+        rect_padding = int(15 * scale_factor)
+        
+        # วาดพื้นหลังสีดำโปร่งแสงหลังข้อความ
+        draw.rectangle(
+            [20 * scale_factor, start_y - rect_padding, width - (20 * scale_factor), start_y + total_height + rect_padding], 
+            fill=(0,0,0,160)
+        )
+        
+        cur_y = start_y
+        for line in lines:
+            try: # Pillow >= 10.0
+                bbox = draw.textbbox((0, 0), line, font=font)
+                text_width = bbox[2] - bbox[0]
+            except AttributeError: # Pillow < 10.0
+                text_width, _ = draw.textsize(line, font=font)
+                
+            x = (width - text_width) / 2
+            # ขอบดำและตัวหนังสือสีขาว
+            draw.text((x-2, cur_y), line, font=font, fill="black")
+            draw.text((x+2, cur_y), line, font=font, fill="black")
+            draw.text((x, cur_y), line, font=font, fill="white")
+            cur_y += line_height
+            
+        img.save(out_path)
+    except Exception as e:
+        print(f"❌ [SUBTITLE ERROR]: {e}", flush=True)
+        # ถ้าพังให้สร้างภาพเปล่าๆ วิดีโอจะได้ไม่พัง
+        Image.new('RGBA', (width, height), (0,0,0,0)).save(out_path)
+
+# -----------------------------
 # Video Processing Functions
 # -----------------------------
 def _run_ffmpeg(cmd: List[str]):
@@ -78,6 +147,7 @@ async def render_video_task(req: RenderRequest):
     """ฟังก์ชันหลักที่ทำงานเบื้องหลัง พร้อมพ่น Log ทุกขั้นตอน"""
     workdir = Path(tempfile.mkdtemp(prefix="render_"))
     total_scenes = len(req.data)
+    has_logo = os.path.exists(LOGO_PATH)
     
     print(f"\n🎬 [START] เริ่มต้นงานเรนเดอร์วิดีโอหุ้น: {req.stock_symbol} จำนวน {total_scenes} ฉาก", flush=True)
     print(f"📁 สร้างพื้นที่ทำงานชั่วคราว: {workdir}", flush=True)
@@ -95,6 +165,7 @@ async def render_video_task(req: RenderRequest):
             
             img_p = assets_dir / f"{s.scene_number}.png"
             aud_p = assets_dir / f"{s.scene_number}.mp3"
+            sub_p = assets_dir / f"{s.scene_number}_sub.png"
             scn_p = scenes_dir / f"{s.scene_number}.mp4"
 
             # 1. Save Image
@@ -106,22 +177,49 @@ async def render_video_task(req: RenderRequest):
             print(f"   -> 🎙️ กำลังดึงเสียงพากย์ AI (TTS)...", flush=True)
             tts = edge_tts.Communicate(s.script, "th-TH-PremwadeeNeural")
             await tts.save(str(aud_p))
+            
+            # 3. Generate Subtitle Image
+            print(f"   -> 🔤 กำลังสร้างภาพซับไตเติ้ล...", flush=True)
+            create_subtitle_image(s.script, str(sub_p), width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT)
 
-            # 3. Build Scene Video
-            print(f"   -> 🎞️ กำลังเรนเดอร์ประกอบภาพและเสียง (FFmpeg)...", flush=True)
-            vf = (f"scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,"
-                  f"pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}")
+            # 4. Build Scene Video (FFmpeg + Filters)
+            print(f"   -> 🎞️ กำลังเรนเดอร์ประกอบภาพ เสียง ซับไตเติ้ล {'และโลโก้ ' if has_logo else ''}(FFmpeg)...", flush=True)
+            
             cmd = [
                 "ffmpeg", "-y", "-loop", "1", "-framerate", str(DEFAULT_FPS),
-                "-i", str(img_p), "-i", str(aud_p),
-                "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-shortest", str(scn_p)
+                "-i", str(img_p),
+                "-i", str(aud_p),
+                "-i", str(sub_p)
             ]
+            
+            # ชุดคำสั่งประกอบร่าง (ซ้อนภาพ, ซ้อนซับ, ซ้อนโลโก้)
+            fc_parts = []
+            fc_parts.append(f"[0:v]scale={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease,pad={DEFAULT_WIDTH}:{DEFAULT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={DEFAULT_FPS}[bg]")
+            
+            if has_logo:
+                cmd.extend(["-i", LOGO_PATH])
+                logo_width = int(200 * (DEFAULT_WIDTH / 720.0)) # ปรับขนาดสัดส่วนเดียวกับโค้ดเก่า
+                fc_parts.append(f"[bg][2:v]overlay=0:0[with_sub]") # ซ้อนซับทับภาพหลัก
+                fc_parts.append(f"[3:v]scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]") # ย่อและทำโปร่งแสงโลโก้ 90%
+                fc_parts.append(f"[with_sub][logo]overlay=W-w-30:30[final_v]") # วางมุมขวาบน (ห่างขอบ 30px)
+            else:
+                fc_parts.append(f"[bg][2:v]overlay=0:0[final_v]") # ถ้าไม่มีโลโก้ ซ้อนแค่ซับ
+                
+            filter_complex = ";".join(fc_parts)
+            
+            cmd.extend([
+                "-filter_complex", filter_complex,
+                "-map", "[final_v]",
+                "-map", "1:a",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-shortest", str(scn_p)
+            ])
+            
             _run_ffmpeg(cmd)
             scene_mp4s.append(scn_p)
             print(f"   ✅ ฉากที่ {s.scene_number} เสร็จสมบูรณ์!", flush=True)
 
-        # 4. Concat all scenes
+        # 5. Concat all scenes
         print(f"\n🔗 [CONCAT] กำลังรวมวิดีโอทั้ง {total_scenes} ฉากเข้าด้วยกัน...", flush=True)
         final_name = f"{req.stock_symbol}_{uuid.uuid4().hex[:6]}.mp4"
         final_path = workdir / final_name
@@ -131,7 +229,7 @@ async def render_video_task(req: RenderRequest):
         _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_p), "-c", "copy", str(final_path)])
         print(f"✅ [CONCAT] รวมไฟล์เสร็จสมบูรณ์ -> {final_name}", flush=True)
 
-        # 5. Upload to Google Cloud Storage
+        # 6. Upload to Google Cloud Storage
         print(f"\n☁️ [UPLOAD] กำลังอัปโหลดขึ้น Google Cloud Storage (Bucket: {GCS_BUCKET})...", flush=True)
         if storage and GCS_BUCKET:
             if GCP_SA_JSON:
@@ -143,8 +241,6 @@ async def render_video_task(req: RenderRequest):
             blob = bucket.blob(f"{GCS_PREFIX}{final_name}")
             blob.upload_from_filename(str(final_path))
             
-            if GCS_PUBLIC:
-                blob.make_public()
             print(f"🎉 [SUCCESS] อัปโหลดสำเร็จ! วิดีโอของคุณพร้อมใช้งานแล้ว", flush=True)
             print(f"🌐 URL: https://storage.googleapis.com/{GCS_BUCKET}/{GCS_PREFIX}{final_name}\n", flush=True)
         else:

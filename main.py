@@ -135,7 +135,7 @@ def create_subtitle_image(text_chunk, out_path, width=1080, height=1920):
         total_height = len(lines) * line_height
         
         # 🔻 ขยับ Subtitle ลงมา 50 px (บวกแกน Y เพิ่ม)
-        start_y = int(150 * scale_factor) + 50 
+        start_y = int(150 * scale_factor) + 100 
         
         rect_padding = int(15 * scale_factor)
         
@@ -190,7 +190,7 @@ def create_info_panel(trade_setup, out_path, width=1080, height=1920):
         total_height = len(lines) * line_height
         
         # 🔺 ขยับ Info Panel ขึ้นไป 50 px (ลบแกน Y ออก)
-        start_y = height - total_height - int(120 * scale_factor) - 50 
+        start_y = height - total_height - int(120 * scale_factor) - 100 
         
         box_x_start = int(40 * scale_factor)
         box_x_end = width - int(40 * scale_factor)
@@ -313,7 +313,7 @@ async def render_video_task(req: RenderRequest):
             if has_logo:
                 cmd.extend(["-i", LOGO_PATH])
                 logo_idx = 3 + len(chunks)
-                logo_width = int(100 * (DEFAULT_WIDTH / 720.0))
+                logo_width = int(150 * (DEFAULT_WIDTH / 720.0))
                 fc_parts.append(f"[{logo_idx}:v]format=rgba,scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
                 fc_parts.append(f"[final_sub][logo]overlay=W-w-30:30[final_v]")
 

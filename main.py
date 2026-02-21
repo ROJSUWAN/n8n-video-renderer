@@ -313,7 +313,7 @@ async def render_video_task(req: RenderRequest):
             if has_logo:
                 cmd.extend(["-i", LOGO_PATH])
                 logo_idx = 3 + len(chunks)
-                logo_width = int(200 * (DEFAULT_WIDTH / 720.0))
+                logo_width = int(100 * (DEFAULT_WIDTH / 720.0))
                 fc_parts.append(f"[{logo_idx}:v]format=rgba,scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
                 fc_parts.append(f"[final_sub][logo]overlay=W-w-30:30[final_v]")
 

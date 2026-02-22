@@ -7,6 +7,7 @@ import base64
 import asyncio
 import tempfile
 import subprocess
+import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -162,6 +163,9 @@ def create_subtitle_image(text_chunk, out_path, width=1080, height=1920):
 # -----------------------------
 # 📊 Create Info Panel
 # -----------------------------
+# -----------------------------
+# 📊 Create Info Panel
+# -----------------------------
 def create_info_panel(trade_setup, out_path, width=1080, height=1920):
     print("🎨 [DRAW] กำลังวาดป้าย Info Panel...", flush=True)
     try:
@@ -178,7 +182,17 @@ def create_info_panel(trade_setup, out_path, width=1080, height=1920):
         target_price = trade_setup.get('target_price', '-')
         trend = trade_setup.get('trend', '-')
 
+        # 🗓️ ส่วนที่เพิ่มใหม่: สร้างวันที่ปัจจุบัน (เวลาไทย UTC+7)
+        thai_months = [
+            "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+            "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+        ]
+        now_bkk = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+        current_date_str = f"{now_bkk.day} {thai_months[now_bkk.month - 1]} {now_bkk.year}"
+
+        # ✏️ ส่วนที่แก้ไข: เพิ่มบรรทัด "วันที่" เข้าไปเป็นรายการแรก
         lines = [
+            f"วันที่          : {current_date_str}",
             f"ราคาปัจจุบัน  : {current_price}",
             f"แนวรับ         : {support}",
             f"แนวต้าน       : {resistance}",
@@ -313,7 +327,7 @@ async def render_video_task(req: RenderRequest):
             if has_logo:
                 cmd.extend(["-i", LOGO_PATH])
                 logo_idx = 3 + len(chunks)
-                logo_width = int(150 * (DEFAULT_WIDTH / 720.0))
+                logo_width = int(200 * (DEFAULT_WIDTH / 720.0))
                 fc_parts.append(f"[{logo_idx}:v]format=rgba,scale={logo_width}:-1,colorchannelmixer=aa=0.9[logo]")
                 fc_parts.append(f"[final_sub][logo]overlay=W-w-30:30[final_v]")
 
